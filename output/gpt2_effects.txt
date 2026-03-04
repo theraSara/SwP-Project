@@ -1,0 +1,43 @@
+Linear mixed model fit by maximum likelihood . t-tests use Satterthwaite's
+  method [lmerModLmerTest]
+Formula: log_rt ~ cloze_surprisal + word_length + log_freq + (1 | SUB) +  
+    (1 | ITEM)
+   Data: df
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+   1216.9    1278.1    -601.5    1202.9     46085 
+
+Scaled residuals: 
+    Min      1Q  Median      3Q     Max 
+-6.5186 -0.6553 -0.1312  0.5472  4.6333 
+
+Random effects:
+ Groups   Name        Variance Std.Dev.
+ SUB      (Intercept) 0.103130 0.32114 
+ ITEM     (Intercept) 0.004167 0.06455 
+ Residual             0.057689 0.24019 
+Number of obs: 46092, groups:  SUB, 216; ITEM, 216
+
+Fixed effects:
+                  Estimate Std. Error         df t value Pr(>|t|)    
+(Intercept)      6.808e+00  3.998e-02  3.703e+02 170.299  < 2e-16 ***
+cloze_surprisal  5.709e-04  9.958e-05  4.557e+04   5.733 9.95e-09 ***
+word_length     -2.693e-03  2.441e-03  2.152e+02  -1.103    0.271    
+log_freq        -6.367e-03  5.278e-03  2.150e+02  -1.206    0.229    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Correlation of Fixed Effects:
+            (Intr) clz_sr wrd_ln
+cloz_srprsl -0.016              
+word_length -0.624  0.002       
+log_freq    -0.761 -0.007  0.429
+Data: df
+Models:
+m_base: log_rt ~ word_length + log_freq + (1 | SUB) + (1 | ITEM)
+m_cloze: log_rt ~ cloze_surprisal + word_length + log_freq + (1 | SUB) + (1 | ITEM)
+        npar    AIC    BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)    
+m_base     6 1247.8 1300.2 -617.88    1235.8                         
+m_cloze    7 1216.9 1278.1 -601.45    1202.9 32.851  1   9.95e-09 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
