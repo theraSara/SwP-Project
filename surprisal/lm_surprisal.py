@@ -132,7 +132,7 @@ def main():
 
     df["uni_surprisal"] = uni_results
     df["bi_surprisal"] = bi_results
-    df.to_csv("bk21_results.csv", index=False)
+    df.to_csv("output/bk21_results.csv", index=False)
 
 if __name__ == "__main__":
     main()
