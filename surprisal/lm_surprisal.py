@@ -177,7 +177,7 @@ def main():
 
     df = pd.read_csv(args.input_csv)
 
-    SMALL_MODEL_THRESHOLD = 1_000_000_000
+    SMALL_MODEL_THRESHOLD = 100_000_000_000
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 
