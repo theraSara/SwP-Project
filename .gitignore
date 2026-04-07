@@ -1,9 +1,12 @@
 data_output/
+data_extraction/
+old_output/
 *.csv
 *.pt
 __pycache__/
 .DS_Store
 .venv/
 archive/
-
-
+old/
+surprisal_1000_top-k/
+output/

@@ -70,7 +70,7 @@ for row in table.rows:
         "prefix": prefix,
         "suffix": suffix,
         "critical_word": critical_word,
-        "target_llm": " " + critical_word
+        "target_llm": critical_word
     })
 
 df = pd.DataFrame(rows)
