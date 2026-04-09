@@ -62,101 +62,89 @@ def compute_bi_surprisal_batched(model, tokenizer, prefix, target, suffix, devic
 
     p_ids = tokenizer.encode(prefix_str, return_tensors="pt", add_special_tokens=True).to(device)
     t_enc = tokenizer.encode(target_str, return_tensors="pt", add_special_tokens=False).to(device)
-    s_enc = tokenizer.encode(suffix_str, return_tensors="pt", add_special_tokens=False).to(device)
-
-    target_id = t_enc[0, 0].item()
-    t_remainder = t_enc[:, 1:]               # empty if single-token target
-    s_ids = torch.cat([t_remainder, s_enc], dim=1)
-
-    p_len = p_ids.shape[1]
+    s_ids = tokenizer.encode(suffix_str, return_tensors="pt", add_special_tokens=False).to(device)
     s_len = s_ids.shape[1]
 
-    # --- Numerator ---
-    # Single forward pass: gives both log P(target|prefix) and log P(suffix|prefix, target)
-    full_seq = torch.cat([p_ids, t_enc[:, :1], s_ids], dim=1)
-    with torch.no_grad():
-        logits = model(full_seq).logits[0]
+    total_bi_surprisal = 0.0
 
-    log_probs_at_target = F.log_softmax(logits[p_len - 1].to(torch.float32), dim=-1)
-    log_prob_target = log_probs_at_target[target_id].item()
+    current_p_ids = p_ids
 
-    log_prob_suffix = 0.0
-    for i in range(s_len):
-        step_lp = F.log_softmax(logits[p_len + i].to(torch.float32), dim=-1)
-        log_prob_suffix += step_lp[s_ids[0, i]].item()
+    for t_idx in range(t_enc.shape[1]):
+        target_id = t_enc[0, t_idx].item()
+        p_len = current_p_ids.shape[1]
 
-    log_num = log_prob_target + log_prob_suffix
-
-    # --- Denominator candidate selection ---
-    # Use full vocab for small-vocab models (exact), top-K for large-vocab models (approximation).
-    # vocab_size is read from logits directly to avoid model.config attribute errors
-    # on quantized Gemma checkpoints.
-    vocab_size = logits.shape[-1]
-    if vocab_size <= full_vocab_threshold:
-        # Full enumeration — no approximation error possible
-        cand_indices = torch.arange(vocab_size, device=device)
-        cand_log_probs = log_probs_at_target
-    else:
-        top_k = torch.topk(log_probs_at_target, k)
-        cand_indices = top_k.indices
-        cand_log_probs = top_k.values
-
-    # --- Denominator forward passes ---
-    # Each candidate replaces the target token; we compute log P(suffix | prefix, candidate).
-    # NOTE: Under 4-bit quantization, this separate forward pass over [prefix|candidate|suffix]
-    # produces slightly different logits than the numerator pass even when candidate == target,
-    # because int4 rounding is not perfectly deterministic across batch configurations.
-    # This can cause log_den < log_num by a tiny margin (< 0.3 bits in practice).
-    # These are clamped to 0 after computation — see below.
-    den_log_terms = []
-    n_cands = cand_indices.shape[0]
-
-    for i in range(0, n_cands, batch_size):
-        b_indices = cand_indices[i: i + batch_size]
-        curr_batch = b_indices.size(0)
-
-        b_cands = b_indices.unsqueeze(1)
-        b_full = torch.cat([
-            p_ids.expand(curr_batch, -1),
-            b_cands,
-            s_ids.expand(curr_batch, -1)
-        ], dim=1)
-
+        full_seq = torch.cat([current_p_ids, t_enc[:, t_idx:t_idx+1], s_ids], dim=1)
         with torch.no_grad():
-            b_logits = model(b_full).logits
+            logits = model(full_seq).logits[0]
 
-        for b_idx in range(curr_batch):
-            cand_log_prob_suffix = 0.0
-            for s_pos in range(s_len):
-                lp = F.log_softmax(b_logits[b_idx, p_len + s_pos].to(torch.float32), dim=-1)
-                cand_log_prob_suffix += lp[s_ids[0, s_pos]].item()
+        log_probs_at_target = F.log_softmax(logits[p_len - 1].to(torch.float32), dim=-1)
+        log_prob_target = log_probs_at_target[target_id].item()
 
-            den_log_terms.append(cand_log_probs[i + b_idx].item() + cand_log_prob_suffix)
+        log_prob_suffix = 0.0
+        for i in range(s_len):
+            step_lp = F.log_softmax(logits[p_len + i].to(torch.float32), dim=-1)
+            log_prob_suffix += step_lp[s_ids[0, i]].item()
 
-    log_den = torch.logsumexp(
-        torch.tensor(den_log_terms, dtype=torch.float64),  # float64 reduces accumulation error
-        dim=0
-    ).item()
+        log_num = log_prob_target + log_prob_suffix
 
-    bi_val = -(log_num - log_den) / math.log(2)
-
-    # Clamp: bi surprisal is mathematically non-negative.
-    # Small negative values (< 0.5 bits) are quantization noise — clamp to 0.
-    # Large negative values indicate a real problem and should be investigated.
-    NOISE_THRESHOLD = 0.5
-    if bi_val < 0:
-        if abs(bi_val) <= NOISE_THRESHOLD:
-            print(f"  [quant noise] bi={bi_val:.4f} bits clamped to 0 "
-                  f"(log_num={log_num:.3f}, log_den={log_den:.3f}, "
-                  f"vocab={vocab_size}, k_used={n_cands})")
-            bi_val = 0.0
+        vocab_size = logits.shape[-1]
+        if vocab_size <= full_vocab_threshold:
+            cand_indices = torch.arange(vocab_size, device=device)
+            cand_log_probs = log_probs_at_target
         else:
-            print(f"  [WARNING] large negative bi={bi_val:.4f} bits — possible real error. "
-                  f"log_num={log_num:.3f}, log_den={log_den:.3f}, "
-                  f"vocab={vocab_size}, k_used={n_cands})")
-            # Do NOT clamp — preserve for inspection
+            top_k = torch.topk(log_probs_at_target, k)
+            cand_indices = top_k.indices
+            cand_log_probs = top_k.values
 
-    return bi_val
+            if not (cand_indices == target_id).any():
+                cand_indices = torch.cat([cand_indices, torch.tensor([target_id], device=device)])
+                target_lp = log_probs_at_target[target_id].unsqueeze(0)
+                cand_log_probs = torch.cat([cand_log_probs, target_lp])
+
+        den_log_terms = []
+        n_cands = cand_indices.shape[0]
+
+        for i in range(0, n_cands, batch_size):
+            b_indices = cand_indices[i: i + batch_size]
+            curr_batch = b_indices.size(0)
+
+            b_cands = b_indices.unsqueeze(1)
+            b_full = torch.cat([
+                current_p_ids.expand(curr_batch, -1),
+                b_cands,
+                s_ids.expand(curr_batch, -1)
+            ], dim=1)
+
+            with torch.no_grad():
+                b_logits = model(b_full).logits
+
+            for b_idx in range(curr_batch):
+                cand_log_prob_suffix = 0.0
+                for s_pos in range(s_len):
+                    lp = F.log_softmax(b_logits[b_idx, p_len + s_pos].to(torch.float32), dim=-1)
+                    cand_log_prob_suffix += lp[s_ids[0, s_pos]].item()
+
+                den_log_terms.append(cand_log_probs[i + b_idx].item() + cand_log_prob_suffix)
+
+        log_den = torch.logsumexp(
+            torch.tensor(den_log_terms, dtype=torch.float64), 
+            dim=0
+        ).item()
+
+        token_bi_val = -(log_num - log_den) / math.log(2)
+
+        NOISE_THRESHOLD = 0.5
+        if token_bi_val < 0:
+            if abs(token_bi_val) <= NOISE_THRESHOLD:
+                token_bi_val = 0.0
+            else:
+                print(f"  [WARNING] large negative bi={token_bi_val:.4f} bits — possible real error. "
+                      f"log_num={log_num:.3f}, log_den={log_den:.3f}, vocab={vocab_size}, k_used={n_cands})")
+
+        total_bi_surprisal += token_bi_val
+        current_p_ids = torch.cat([current_p_ids, t_enc[:, t_idx:t_idx+1]], dim=1)
+
+    return total_bi_surprisal
 
 
 def main():
@@ -177,11 +165,10 @@ def main():
 
     df = pd.read_csv(args.input_csv)
 
-    SMALL_MODEL_THRESHOLD = 100_000_000_000
+    SMALL_MODEL_THRESHOLD = 1_000_000_000
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 
-    # Count params without allocating weights on GPU
     config = AutoConfig.from_pretrained(args.model_id)
     with torch.device("meta"):
         dummy = AutoModelForCausalLM.from_config(config)
@@ -211,14 +198,12 @@ def main():
     print(f"Model loaded on device: {device}")
     model.eval()
 
-    # --- Checkpoint resume ---
     checkpoint_path = args.output_csv.replace(".csv", "_checkpoint.csv")
 
     if os.path.exists(checkpoint_path):
         checkpoint_df = pd.read_csv(checkpoint_path)
 
         uni_ok = checkpoint_df[args.output_col_uni].notna()
-        # Exclude rows with negative bi — they need recomputation with higher K or clamping
         bi_ok = checkpoint_df[args.output_col_bi].notna() & \
                 (checkpoint_df[args.output_col_bi] >= 0)
 
@@ -239,12 +224,10 @@ def main():
     metadata_path = args.output_csv.replace(".csv", "_metadata.pt")
     if os.path.exists(metadata_path):
         all_meta = torch.load(metadata_path, weights_only=False)
-        # Drop metadata for any rows being recomputed to avoid duplicates
         metadata_list = [m for m in all_meta if m['index'] in completed_indices]
     else:
         metadata_list = []
 
-    # --- Main loop ---
     for i, row in tqdm(df.iterrows(), total=len(df)):
         if i in completed_indices:
             continue
