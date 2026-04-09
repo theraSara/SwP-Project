@@ -44,6 +44,6 @@ case \$1 in
         ;;
     *)
         echo "Invalid command."
-        echo "Usage: ./run.sh [gpt2|gemma270m|gemma12b|all]"
+        echo "Usage: ./run_nltk.sh [gpt2|gemma270m|gemma12b|all]"
         ;;
 esac
