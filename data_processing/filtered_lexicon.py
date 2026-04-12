@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import pandas as pd
+from wordfreq import zipf_frequency
 
 
 def normalize_word(w):
@@ -13,23 +14,25 @@ def normalize_word(w):
     return w
 
 
-def is_good_word_basic(w, min_len=2, max_len=20, allow_apostrophe=False):
+def is_good_word_filtered(w, min_len=2, max_len=15, min_zipf=3.0):
     if not w:
         return False
 
-    if allow_apostrophe:
-        pattern = r"^[a-z]+(?:'[a-z]+)?$"
-    else:
-        pattern = r"^[a-z]+$"
+    w = w.lower().strip()
 
-    if not re.fullmatch(pattern, w):
+    if not re.fullmatch(r"[a-z]+", w):
         return False
 
-    if len(w) < min_len or len(w) > max_len:
+    if not (min_len <= len(w) <= max_len):
         return False
 
-    # Remove long repeated-character weird strings
+    if len(w) >= 5 and sum(ch in "aeiouy" for ch in w) == 0:
+        return False
+
     if re.search(r"(.)\1\1", w):
+        return False
+
+    if zipf_frequency(w, "en") < min_zipf:
         return False
 
     return True
@@ -62,6 +65,7 @@ def main():
     parser.add_argument("--min_len", type=int, default=2)
     parser.add_argument("--max_len", type=int, default=20)
     parser.add_argument("--allow_apostrophe", action="store_true")
+    parser.add_argument("--min_zipf", type=float, default=3.0)
 
     args = parser.parse_args()
 
@@ -98,11 +102,11 @@ def main():
             if w_norm is None:
                 continue
 
-            if not is_good_word_basic(
+            if not is_good_word_filtered(
                 w_norm,
                 min_len=args.min_len,
                 max_len=args.max_len,
-                allow_apostrophe=args.allow_apostrophe
+                min_zipf=args.min_zipf
             ):
                 continue
 
