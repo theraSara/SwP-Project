@@ -18,7 +18,8 @@ def compute_uni_surprisal(model, tokenizer, prefix, target, device):
 
     p_enc = tokenizer(prefix, return_tensors="pt", add_special_tokens=True).to(device)
     t_enc = tokenizer(target, return_tensors="pt", add_special_tokens=False).to(device)
-    f_ids = torch.cat([p_enc.input_ids, t_enc.input_ids], dim=1)  # [1, seq_len]
+    f_ids = torch.cat([p_enc.input_ids, t_enc.input_ids], dim=1)
+
     p_len = p_enc.input_ids.shape[1]
     f_len = f_ids.shape[1]
 
@@ -31,7 +32,7 @@ def compute_uni_surprisal(model, tokenizer, prefix, target, device):
     for pos in range(p_len, f_len):
         token_id = f_ids[0, pos].item()
 
-        step_logits = logits[pos - 1].to(torch.float32)
+        step_logits = logits[pos - 1].float()
         log_probs = F.log_softmax(step_logits, dim=-1)
         probs = F.softmax(step_logits, dim=-1)
 
@@ -45,14 +46,42 @@ def compute_uni_surprisal(model, tokenizer, prefix, target, device):
             "token_str": tokenizer.decode([token_id]),
             "surprisal": token_surprisal,
             "entropy": entropy_bits,
-            "logits": step_logits.cpu().numpy()
         })
 
     return {"uni_val": total_uni, "token_data": token_data}
 
 
-def compute_bi_surprisal_batched(model, tokenizer, prefix, target, suffix, device,
-                                  k=500, batch_size=20, full_vocab_threshold=60000):
+def _score_suffix_from_logits(batch_logits, p_len, s_ids):
+    """
+    batch_logits: [batch, seq_len, vocab]
+    Returns:
+        suffix log-prob for each batch item: [batch]
+    """
+    batch_size = batch_logits.shape[0]
+    suffix_len = s_ids.shape[1]
+
+    if suffix_len == 0:
+        return torch.zeros(batch_size, device=batch_logits.device)
+
+    suffix_logits = batch_logits[:, p_len:p_len + suffix_len, :].float()  # [B, suffix_len, V]
+    suffix_log_probs = F.log_softmax(suffix_logits, dim=-1)
+
+    gold_suffix = s_ids.expand(batch_size, -1).unsqueeze(-1)  # [B, suffix_len, 1]
+    suffix_lp = suffix_log_probs.gather(2, gold_suffix).squeeze(-1).sum(dim=1)  # [B]
+
+    return suffix_lp
+
+
+def compute_bi_surprisal_topk(
+    model,
+    tokenizer,
+    prefix,
+    target,
+    suffix,
+    device,
+    k=10000,
+    cand_batch_size=128,
+):
     if pd.isna(suffix) or str(suffix).strip() == "":
         return float("nan")
 
@@ -61,88 +90,149 @@ def compute_bi_surprisal_batched(model, tokenizer, prefix, target, suffix, devic
     suffix_str = " " + str(suffix).lstrip()
 
     p_ids = tokenizer.encode(prefix_str, return_tensors="pt", add_special_tokens=True).to(device)
-    t_enc = tokenizer.encode(target_str, return_tensors="pt", add_special_tokens=False).to(device)
+    t_ids = tokenizer.encode(target_str, return_tensors="pt", add_special_tokens=False).to(device)
     s_ids = tokenizer.encode(suffix_str, return_tensors="pt", add_special_tokens=False).to(device)
-    s_len = s_ids.shape[1]
 
     total_bi_surprisal = 0.0
-
     current_p_ids = p_ids
+    vocab_size = model.config.vocab_size
 
-    for t_idx in range(t_enc.shape[1]):
-        target_id = t_enc[0, t_idx].item()
+    for t_idx in range(t_ids.shape[1]):
+        target_id = t_ids[0, t_idx].item()
         p_len = current_p_ids.shape[1]
 
-        full_seq = torch.cat([current_p_ids, t_enc[:, t_idx:t_idx+1], s_ids], dim=1)
+        # Numerator: true token + suffix
+        true_seq = torch.cat([current_p_ids, t_ids[:, t_idx:t_idx+1], s_ids], dim=1)
+
         with torch.no_grad():
-            logits = model(full_seq).logits[0]
+            true_logits = model(true_seq).logits  # [1, seq, vocab]
 
-        log_probs_at_target = F.log_softmax(logits[p_len - 1].to(torch.float32), dim=-1)
-        log_prob_target = log_probs_at_target[target_id].item()
+        true_logits_0 = true_logits[0]
 
-        log_prob_suffix = 0.0
-        for i in range(s_len):
-            step_lp = F.log_softmax(logits[p_len + i].to(torch.float32), dim=-1)
-            log_prob_suffix += step_lp[s_ids[0, i]].item()
+        target_log_probs = F.log_softmax(true_logits_0[p_len - 1].float(), dim=-1)
+        log_prob_target = target_log_probs[target_id].item()
 
+        log_prob_suffix = _score_suffix_from_logits(true_logits, p_len, s_ids)[0].item()
         log_num = log_prob_target + log_prob_suffix
 
-        vocab_size = logits.shape[-1]
-        if vocab_size <= full_vocab_threshold:
-            cand_indices = torch.arange(vocab_size, device=device)
-            cand_log_probs = log_probs_at_target
-        else:
-            top_k = torch.topk(log_probs_at_target, k)
-            cand_indices = top_k.indices
-            cand_log_probs = top_k.values
+        # Top-k candidate set
+        k_eff = min(k, vocab_size)
+        topk = torch.topk(target_log_probs, k_eff)
+        cand_indices = topk.indices
+        cand_lp = topk.values
 
-            if not (cand_indices == target_id).any():
-                cand_indices = torch.cat([cand_indices, torch.tensor([target_id], device=device)])
-                target_lp = log_probs_at_target[target_id].unsqueeze(0)
-                cand_log_probs = torch.cat([cand_log_probs, target_lp])
+        # ensure target included
+        if not (cand_indices == target_id).any():
+            cand_indices = torch.cat([cand_indices, torch.tensor([target_id], device=device)])
+            cand_lp = torch.cat([cand_lp, target_log_probs[target_id].unsqueeze(0)])
 
-        den_log_terms = []
+        den_terms = []
         n_cands = cand_indices.shape[0]
 
-        for i in range(0, n_cands, batch_size):
-            b_indices = cand_indices[i: i + batch_size]
-            curr_batch = b_indices.size(0)
+        for start in range(0, n_cands, cand_batch_size):
+            end = min(start + cand_batch_size, n_cands)
+            curr_ids = cand_indices[start:end].unsqueeze(1)  # [bs, 1]
+            curr_bs = curr_ids.shape[0]
 
-            b_cands = b_indices.unsqueeze(1)
-            b_full = torch.cat([
-                current_p_ids.expand(curr_batch, -1),
-                b_cands,
-                s_ids.expand(curr_batch, -1)
-            ], dim=1)
+            batch_prefix = current_p_ids.expand(curr_bs, -1)
+            batch_suffix = s_ids.expand(curr_bs, -1)
+            batch_seq = torch.cat([batch_prefix, curr_ids, batch_suffix], dim=1)
 
             with torch.no_grad():
-                b_logits = model(b_full).logits
+                batch_logits = model(batch_seq).logits  # [bs, seq, vocab]
 
-            for b_idx in range(curr_batch):
-                cand_log_prob_suffix = 0.0
-                for s_pos in range(s_len):
-                    lp = F.log_softmax(b_logits[b_idx, p_len + s_pos].to(torch.float32), dim=-1)
-                    cand_log_prob_suffix += lp[s_ids[0, s_pos]].item()
+            suffix_lp = _score_suffix_from_logits(batch_logits, p_len, s_ids)
+            terms = cand_lp[start:end] + suffix_lp
+            den_terms.append(terms.detach().cpu())
 
-                den_log_terms.append(cand_log_probs[i + b_idx].item() + cand_log_prob_suffix)
-
-        log_den = torch.logsumexp(
-            torch.tensor(den_log_terms, dtype=torch.float64), 
-            dim=0
-        ).item()
-
+        log_den = torch.logsumexp(torch.cat(den_terms).double(), dim=0).item()
         token_bi_val = -(log_num - log_den) / math.log(2)
 
-        NOISE_THRESHOLD = 0.5
-        if token_bi_val < 0:
-            if abs(token_bi_val) <= NOISE_THRESHOLD:
-                token_bi_val = 0.0
-            else:
-                print(f"  [WARNING] large negative bi={token_bi_val:.4f} bits — possible real error. "
-                      f"log_num={log_num:.3f}, log_den={log_den:.3f}, vocab={vocab_size}, k_used={n_cands})")
+        if token_bi_val < -1e-6:
+            print(f"[WARNING] Negative top-k BI surprisal: {token_bi_val:.6f}")
 
-        total_bi_surprisal += token_bi_val
-        current_p_ids = torch.cat([current_p_ids, t_enc[:, t_idx:t_idx+1]], dim=1)
+        total_bi_surprisal += max(token_bi_val, 0.0)
+
+        # advance with true token
+        current_p_ids = torch.cat([current_p_ids, t_ids[:, t_idx:t_idx+1]], dim=1)
+
+    return total_bi_surprisal
+
+
+def compute_bi_surprisal_full_vocab(
+    model,
+    tokenizer,
+    prefix,
+    target,
+    suffix,
+    device,
+    cand_batch_size=128,
+):
+    if pd.isna(suffix) or str(suffix).strip() == "":
+        return float("nan")
+
+    target_str = " " + str(target).strip()
+    prefix_str = str(prefix).rstrip()
+    suffix_str = " " + str(suffix).lstrip()
+
+    p_ids = tokenizer.encode(prefix_str, return_tensors="pt", add_special_tokens=True).to(device)
+    t_ids = tokenizer.encode(target_str, return_tensors="pt", add_special_tokens=False).to(device)
+    s_ids = tokenizer.encode(suffix_str, return_tensors="pt", add_special_tokens=False).to(device)
+
+    total_bi_surprisal = 0.0
+    current_p_ids = p_ids
+    vocab_size = model.config.vocab_size
+
+    for t_idx in range(t_ids.shape[1]):
+        target_id = t_ids[0, t_idx].item()
+        p_len = current_p_ids.shape[1]
+
+        # Numerator
+        true_seq = torch.cat([current_p_ids, t_ids[:, t_idx:t_idx+1], s_ids], dim=1)
+
+        with torch.no_grad():
+            true_logits = model(true_seq).logits  # [1, seq, vocab]
+
+        true_logits_0 = true_logits[0]
+
+        target_log_probs = F.log_softmax(true_logits_0[p_len - 1].float(), dim=-1)
+        log_prob_target = target_log_probs[target_id].item()
+
+        log_prob_suffix = _score_suffix_from_logits(true_logits, p_len, s_ids)[0].item()
+        log_num = log_prob_target + log_prob_suffix
+
+        # Full-vocab denominator
+        den_terms = []
+
+        for start in range(0, vocab_size, cand_batch_size):
+            end = min(start + cand_batch_size, vocab_size)
+            curr_bs = end - start
+
+            cand_ids = torch.arange(start, end, device=device).unsqueeze(1)  # [bs, 1]
+            batch_prefix = current_p_ids.expand(curr_bs, -1)
+            batch_suffix = s_ids.expand(curr_bs, -1)
+
+            batch_seq = torch.cat([batch_prefix, cand_ids, batch_suffix], dim=1)
+
+            with torch.no_grad():
+                batch_logits = model(batch_seq).logits  # [bs, seq, vocab]
+
+            cand_lp = target_log_probs[start:end]
+            suffix_lp = _score_suffix_from_logits(batch_logits, p_len, s_ids)
+
+            terms = cand_lp + suffix_lp
+            den_terms.append(terms.detach().cpu())
+
+        log_den = torch.logsumexp(torch.cat(den_terms).double(), dim=0).item()
+        token_bi_val = -(log_num - log_den) / math.log(2)
+
+        if token_bi_val < -1e-6:
+            print(f"[WARNING] Negative full-vocab BI surprisal: {token_bi_val:.6f}")
+
+        total_bi_surprisal += max(token_bi_val, 0.0)
+
+        # advance with true token
+        current_p_ids = torch.cat([current_p_ids, t_ids[:, t_idx:t_idx+1]], dim=1)
 
     return total_bi_surprisal
 
@@ -152,15 +242,20 @@ def main():
     parser.add_argument("--input_csv", type=str, default="data/bk21_stimuli.csv")
     parser.add_argument("--output_csv", type=str, required=True)
     parser.add_argument("--model_id", type=str, required=True)
+
     parser.add_argument("--output_col_uni", type=str, default="uni_surprisal")
     parser.add_argument("--output_col_bi", type=str, default="bi_surprisal")
+
     parser.add_argument("--prefix_col", type=str, default="prefix")
     parser.add_argument("--target_col", type=str, default="target_llm")
     parser.add_argument("--suffix_col", type=str, default="suffix")
-    parser.add_argument("--k", type=int, default=5000,
+
+    parser.add_argument("--bi_mode", type=str, default="topk", choices=["topk", "full"])
+    parser.add_argument("--k", type=int, default=10000,
                         help="Top-K candidates for bidirectional approximation")
-    parser.add_argument("--batch_size", type=int, default=200,
-                        help="Batch size for denominator forward passes")
+    parser.add_argument("--cand_batch_size", type=int, default=128,
+                        help="Candidate batch size for denominator scoring")
+
     args = parser.parse_args()
 
     df = pd.read_csv(args.input_csv)
@@ -178,9 +273,7 @@ def main():
     use_quantization = n_params >= SMALL_MODEL_THRESHOLD
 
     if use_quantization:
-        bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-        )
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         print(f"Loading model {args.model_id} ({n_params/1e9:.1f}B params) in 8-bit mode...")
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id,
@@ -199,13 +292,13 @@ def main():
     model.eval()
 
     checkpoint_path = args.output_csv.replace(".csv", "_checkpoint.csv")
+    metadata_path = args.output_csv.replace(".csv", "_metadata.pt")
 
     if os.path.exists(checkpoint_path):
         checkpoint_df = pd.read_csv(checkpoint_path)
 
         uni_ok = checkpoint_df[args.output_col_uni].notna()
-        bi_ok = checkpoint_df[args.output_col_bi].notna() & \
-                (checkpoint_df[args.output_col_bi] >= 0)
+        bi_ok = checkpoint_df[args.output_col_bi].notna() & (checkpoint_df[args.output_col_bi] >= 0)
 
         completed_indices = set(checkpoint_df.index[uni_ok & bi_ok])
 
@@ -215,44 +308,63 @@ def main():
         n_negative = int((checkpoint_df[args.output_col_bi] < 0).sum())
         print(f"Resuming from checkpoint: {len(completed_indices)}/{len(df)} items done.")
         if n_negative > 0:
-            print(f"  → {n_negative} rows with negative bi will be recomputed.")
+            print(f"  -> {n_negative} rows with negative BI values will be recomputed.")
     else:
         completed_indices = set()
         df[args.output_col_uni] = float("nan")
         df[args.output_col_bi] = float("nan")
 
-    metadata_path = args.output_csv.replace(".csv", "_metadata.pt")
     if os.path.exists(metadata_path):
         all_meta = torch.load(metadata_path, weights_only=False)
-        metadata_list = [m for m in all_meta if m['index'] in completed_indices]
+        metadata_list = [m for m in all_meta if m["index"] in completed_indices]
     else:
         metadata_list = []
 
     for i, row in tqdm(df.iterrows(), total=len(df)):
         if i in completed_indices:
             continue
+
         try:
             res = compute_uni_surprisal(
                 model, tokenizer, row[args.prefix_col], row[args.target_col], device
             )
             uni_val = res["uni_val"] if res else float("nan")
-            bi_val = compute_bi_surprisal_batched(
-                model, tokenizer,
-                row[args.prefix_col], row[args.target_col], row[args.suffix_col],
-                device, k=args.k, batch_size=args.batch_size
-            )
+
+            if args.bi_mode == "full":
+                bi_val = compute_bi_surprisal_full_vocab(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prefix=row[args.prefix_col],
+                    target=row[args.target_col],
+                    suffix=row[args.suffix_col],
+                    device=device,
+                    cand_batch_size=args.cand_batch_size,
+                )
+            else:
+                bi_val = compute_bi_surprisal_topk(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prefix=row[args.prefix_col],
+                    target=row[args.target_col],
+                    suffix=row[args.suffix_col],
+                    device=device,
+                    k=args.k,
+                    cand_batch_size=args.cand_batch_size,
+                )
 
             df.at[i, args.output_col_uni] = uni_val
             df.at[i, args.output_col_bi] = bi_val
 
-            if res:
-                metadata_list.append({
-                    "index": i,
-                    "uni_surprisal": uni_val,
-                    "bi_surprisal": bi_val,
-                    "token_data": res["token_data"],
-                    "model_id": args.model_id
-                })
+            metadata_list.append({
+                "index": i,
+                "uni_surprisal": uni_val,
+                "bi_surprisal": bi_val,
+                "token_data": res["token_data"] if res else None,
+                "model_id": args.model_id,
+                "bi_mode": args.bi_mode,
+                "k": args.k if args.bi_mode == "topk" else None,
+                "cand_batch_size": args.cand_batch_size,
+            })
 
             if i % 10 == 0:
                 df.to_csv(checkpoint_path, index=False)
@@ -273,8 +385,10 @@ def main():
 
     df.to_csv(args.output_csv, index=False)
     torch.save(metadata_list, metadata_path)
+
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
+
     print(f"Done! CSV saved to {args.output_csv}")
     print(f"Metadata saved to {metadata_path}")
 

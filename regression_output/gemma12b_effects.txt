@@ -1,0 +1,114 @@
+
+================ UNIDIRECTIONAL ================
+Linear mixed model fit by maximum likelihood . t-tests use Satterthwaite's
+  method [lmerModLmerTest]
+Formula: log_rt ~ s_g12b_uni + s_word_length + s_word_freq + s_word_pos +  
+    (1 | SUB) + (1 | ITEM)
+   Data: df
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+  10396.8   10466.7   -5190.4   10380.8     46084 
+
+Scaled residuals: 
+     Min       1Q   Median       3Q      Max 
+-10.0516  -0.6025  -0.1257   0.4959   6.3586 
+
+Random effects:
+ Groups   Name        Variance Std.Dev.
+ SUB      (Intercept) 0.104490 0.32325 
+ ITEM     (Intercept) 0.004156 0.06447 
+ Residual             0.070524 0.26556 
+Number of obs: 46092, groups:  SUB, 216; ITEM, 216
+
+Fixed effects:
+               Estimate Std. Error        df t value Pr(>|t|)    
+(Intercept)   6.769e+00  2.246e-02 2.330e+02 301.336  < 2e-16 ***
+s_g12b_uni    9.042e-03  1.334e-03 4.543e+04   6.780 1.21e-11 ***
+s_word_length 1.027e-02  4.668e-03 2.150e+02   2.201 0.028834 *  
+s_word_freq   3.575e-04  4.660e-03 2.157e+02   0.077 0.938916    
+s_word_pos    1.743e-02  4.528e-03 2.161e+02   3.850 0.000156 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+            (Intr) s_g12_ s_wrd_l s_wrd_f
+s_g12b_uni   0.000                       
+s_wrd_lngth  0.001 -0.001                
+s_word_freq -0.001  0.035  0.210         
+s_word_pos   0.003  0.014  0.040   0.009 
+[1] "--- Does Gemma-12B (UNI) improve over baseline? ---"
+Data: df
+Models:
+m_base: log_rt ~ s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_g12b: log_rt ~ s_g12b_uni + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+       npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)    
+m_base    7 10441 10502 -5213.4     10427                         
+m_g12b    8 10397 10467 -5190.4     10381 45.936  1  1.222e-11 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+[1] "--- Does Gemma-12B (UNI) explain variance not captured by humans? ---"
+Data: df
+Models:
+m_cloze: log_rt ~ s_cloze + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_both_g12b: log_rt ~ s_cloze + s_g12b_uni + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+            npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)  
+m_cloze        8 10403 10473 -5193.4     10387                       
+m_both_g12b    9 10398 10477 -5190.1     10380 6.5174  1    0.01068 *
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+================ BIDIRECTIONAL ================
+Linear mixed model fit by maximum likelihood . t-tests use Satterthwaite's
+  method [lmerModLmerTest]
+Formula: log_rt ~ s_g12b_bi + s_word_length + s_word_freq + s_word_pos +  
+    (1 | SUB) + (1 | ITEM)
+   Data: df
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+  10412.2   10482.1   -5198.1   10396.2     46084 
+
+Scaled residuals: 
+     Min       1Q   Median       3Q      Max 
+-10.0545  -0.6020  -0.1262   0.4970   6.3589 
+
+Random effects:
+ Groups   Name        Variance Std.Dev.
+ SUB      (Intercept) 0.104489 0.32325 
+ ITEM     (Intercept) 0.004101 0.06404 
+ Residual             0.070552 0.26562 
+Number of obs: 46092, groups:  SUB, 216; ITEM, 216
+
+Fixed effects:
+               Estimate Std. Error        df t value Pr(>|t|)    
+(Intercept)   6.769e+00  2.246e-02 2.328e+02 301.414  < 2e-16 ***
+s_g12b_bi     8.119e-03  1.470e-03 3.958e+04   5.524 3.33e-08 ***
+s_word_length 1.057e-02  4.639e-03 2.152e+02   2.278 0.023688 *  
+s_word_freq   7.103e-05  4.631e-03 2.157e+02   0.015 0.987776    
+s_word_pos    1.726e-02  4.500e-03 2.162e+02   3.834 0.000165 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+            (Intr) s_g12_ s_wrd_l s_wrd_f
+s_g12b_bi    0.000                       
+s_wrd_lngth  0.001  0.010                
+s_word_freq -0.001  0.032  0.211         
+s_word_pos   0.003  0.010  0.040   0.008 
+[1] "--- Does Gemma-12B (BI) improve over baseline? ---"
+Data: df
+Models:
+m_base: log_rt ~ s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_g12b_bi: log_rt ~ s_g12b_bi + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+          npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)    
+m_base       7 10441 10502 -5213.4     10427                         
+m_g12b_bi    8 10412 10482 -5198.1     10396 30.504  1  3.332e-08 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+[1] "--- Does Gemma-12B (BI) explain variance not captured by humans? ---"
+Data: df
+Models:
+m_cloze: log_rt ~ s_cloze + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_both_g12b_bi: log_rt ~ s_cloze + s_g12b_bi + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+               npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)
+m_cloze           8 10403 10473 -5193.4     10387                     
+m_both_g12b_bi    9 10403 10482 -5192.7     10385 1.3648  1     0.2427
