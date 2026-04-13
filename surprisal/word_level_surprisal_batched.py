@@ -214,17 +214,14 @@ def load_model_and_tokenizer(model_id):
     use_quantization = n_params >= SMALL_MODEL_THRESHOLD
 
     if use_quantization:
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in 8-bit mode...")
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True
+        )
+        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in 8-bit mode with CPU offload...")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
-            device_map="auto",
-        )
-    else:
-        print(f"Loading model {model_id} ({n_params/1e6:.0f}M params) in fp32...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
             device_map="auto",
         )
 
