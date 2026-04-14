@@ -122,17 +122,15 @@ def score_candidate_batch(model, prefix_ids, cand_ids_batch, suffix_ids):
 
     full_ids = torch.cat([batch_prefix, cand_ids_batch, batch_suffix], dim=1)
 
+    # NEW — memory safe
     with torch.no_grad():
-        logits = model(full_ids).logits
+        logits = model(full_ids).logits 
 
-    # All probability math in float64
-    logits = logits.double()
     total_lp = torch.zeros(B, device=logits.device, dtype=torch.float64)
 
-    # candidate word tokens
     for j in range(cand_len):
-        step_logits = logits[:, p_len - 1 + j, :]
-        step_log_probs = F.log_softmax(step_logits, dim=-1)
+        step_logits = logits[:, p_len - 1 + j, :].float() 
+        step_log_probs = F.log_softmax(step_logits, dim=-1).double() 
         token_ids = cand_ids_batch[:, j].unsqueeze(1)
         total_lp += step_log_probs.gather(1, token_ids).squeeze(1)
 
