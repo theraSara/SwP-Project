@@ -200,7 +200,7 @@ def compute_bi_surprisal_word_batched(
     return max(bi_val, 0.0)
 
 
-def load_model_and_tokenizer(model_id):
+def load_model_and_tokenizer(model_id, force_fp16=False):
     SMALL_MODEL_THRESHOLD = 1_000_000_000
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -211,17 +211,24 @@ def load_model_and_tokenizer(model_id):
     n_params = sum(p.numel() for p in dummy.parameters())
     del dummy
 
-    use_quantization = n_params >= SMALL_MODEL_THRESHOLD
+    use_quantization = n_params >= SMALL_MODEL_THRESHOLD and not force_fp16
 
     if use_quantization:
         bnb_config = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_enable_fp32_cpu_offload=True
         )
-        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in 8-bit mode with CPU offload...")
+        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in 8-bit mode...")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             quantization_config=bnb_config,
+            device_map="auto",
+        )
+    else:
+        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in bf16...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
             device_map="auto",
         )
 
@@ -252,13 +259,14 @@ def run_for_model(
     suffix_col,
     cand_batch_size,
     save_every,
+    quantizaton
 ):
     print("=" * 80)
     print(f"RUNNING MODEL: {model_id}")
     print("=" * 80)
 
     df = pd.read_csv(input_csv)
-    model, tokenizer, device = load_model_and_tokenizer(model_id)
+    model, tokenizer, device = load_model_and_tokenizer(model_id, force_fp16=quantizaton)
 
     candidate_words = load_candidate_words(lexicon_file)
     print(f"Loaded {len(candidate_words)} candidate words.")
@@ -380,6 +388,7 @@ def main():
 
     parser.add_argument("--cand_batch_size", type=int, default=128)
     parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--no_quantization", action="store_true")
 
     args = parser.parse_args()
 
@@ -401,6 +410,7 @@ def main():
             suffix_col=args.suffix_col,
             cand_batch_size=args.cand_batch_size,
             save_every=args.save_every,
+            quantizaton=args.no_quantization
         )
 
 
