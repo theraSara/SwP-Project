@@ -16,25 +16,6 @@ def safe_model_name(model_id):
     return model_id.replace("/", "_")
 
 
-def score_continuation_logprob_single(model, prefix_ids, continuation_ids):
-    full_ids = torch.cat([prefix_ids, continuation_ids], dim=1)
-
-    with torch.no_grad():
-        logits = model(full_ids).logits[0]
-
-    p_len = prefix_ids.shape[1]
-    c_len = continuation_ids.shape[1]
-
-    total_lp = 0.0
-    for pos in range(c_len):
-        token_id = continuation_ids[0, pos].item()
-        step_logits = logits[p_len - 1 + pos].float()
-        log_probs = F.log_softmax(step_logits, dim=-1)
-        total_lp += log_probs[token_id].item()
-
-    return total_lp
-
-
 def compute_uni_surprisal_word(model, tokenizer, prefix, target, device):
     if pd.isna(prefix) or pd.isna(target):
         return None
@@ -96,8 +77,14 @@ def load_candidate_words(lexicon_file):
 
 
 def build_candidate_groups(tokenizer, candidate_words, device):
+    """
+    Pre-tokenize candidate words and group by token length.
+    Also returns a mapping from word -> (tok_len, index_within_group)
+    so we can find the target word's score from the batch.
+    """
     groups = defaultdict(lambda: {"words": [], "ids": []})
     candidate_word_set = set()
+    word_location = {}  # word -> (tok_len, index_in_group)
 
     for w in tqdm(candidate_words, desc="Tokenizing candidate lexicon", leave=False):
         w = str(w).strip()
@@ -109,14 +96,22 @@ def build_candidate_groups(tokenizer, candidate_words, device):
             continue
 
         tok_len = ids.shape[1]
+        idx_in_group = len(groups[tok_len]["words"])
         groups[tok_len]["words"].append(w)
         groups[tok_len]["ids"].append(ids)
         candidate_word_set.add(w)
+        word_location[w] = (tok_len, idx_in_group)
 
-    return groups, candidate_word_set
+    return groups, candidate_word_set, word_location
 
 
 def score_candidate_batch(model, prefix_ids, cand_ids_batch, suffix_ids):
+    """
+    Score log P(candidate_tokens + suffix | prefix) for a batch of candidates
+    that all have the same token length.
+
+    Returns: [B] tensor of log-probabilities in float64
+    """
     B = cand_ids_batch.shape[0]
     p_len = prefix_ids.shape[1]
     cand_len = cand_ids_batch.shape[1]
@@ -128,9 +123,11 @@ def score_candidate_batch(model, prefix_ids, cand_ids_batch, suffix_ids):
     full_ids = torch.cat([batch_prefix, cand_ids_batch, batch_suffix], dim=1)
 
     with torch.no_grad():
-        logits = model(full_ids).logits.float()
+        logits = model(full_ids).logits
 
-    total_lp = torch.zeros(B, device=logits.device)
+    # All probability math in float64
+    logits = logits.double()
+    total_lp = torch.zeros(B, device=logits.device, dtype=torch.float64)
 
     # candidate word tokens
     for j in range(cand_len):
@@ -157,9 +154,17 @@ def compute_bi_surprisal_word_batched(
     suffix,
     candidate_groups,
     candidate_word_set,
+    word_location,
     device,
     cand_batch_size=128,
 ):
+    """
+    Whole-word bidirectional surprisal.
+
+    Key fix: the numerator is extracted FROM the denominator batch,
+    not computed separately. This guarantees log_num <= log_den
+    and therefore surprisal >= 0.
+    """
     if pd.isna(prefix) or pd.isna(target) or pd.isna(suffix):
         return float("nan")
 
@@ -171,36 +176,77 @@ def compute_bi_surprisal_word_batched(
     prefix_ids = tokenizer(prefix_str, return_tensors="pt", add_special_tokens=True).input_ids.to(device)
     suffix_ids = tokenizer(suffix_str, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
 
-    target_ids = tokenizer(" " + target_word, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-    true_continuation = torch.cat([target_ids, suffix_ids], dim=1)
-    log_num = score_continuation_logprob_single(model, prefix_ids, true_continuation)
+    # If target not in lexicon, we need to add it
+    target_in_lexicon = target_word in candidate_word_set
+    if not target_in_lexicon:
+        target_ids = tokenizer(" " + target_word, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+        target_tok_len = target_ids.shape[1]
 
+    # Find where the target word lives in the candidate groups
+    target_batch_idx = None  # will be set when we find it
+    target_batch_start = None
+    target_tok_len_found = None
+
+    log_num = None
     den_terms = []
 
-    for tok_len, group in candidate_groups.items():
+    for tok_len in sorted(candidate_groups.keys()):
+        group = candidate_groups[tok_len]
         ids_list = group["ids"]
+        words_list = group["words"]
         n = len(ids_list)
 
         for start in range(0, n, cand_batch_size):
             end = min(start + cand_batch_size, n)
             batch_ids = ids_list[start:end]
+            batch_words = words_list[start:end]
+
             cand_ids_batch = torch.cat(batch_ids, dim=0)
             batch_lp = score_candidate_batch(model, prefix_ids, cand_ids_batch, suffix_ids)
+
             den_terms.append(batch_lp.detach().cpu())
 
-    if target_word not in candidate_word_set:
-        den_terms.append(torch.tensor([log_num], dtype=torch.float32))
+            # Check if target word is in this batch
+            if target_in_lexicon and log_num is None:
+                for local_idx, w in enumerate(batch_words):
+                    if w == target_word:
+                        log_num = batch_lp[local_idx].item()
+                        break
 
-    log_den = torch.logsumexp(torch.cat(den_terms).double(), dim=0).item()
+    # If target was not in lexicon, score it separately and add to denominator
+    if not target_in_lexicon:
+        # Score target as a single-item batch using same code path
+        target_ids_for_batch = tokenizer(
+            " " + target_word, return_tensors="pt", add_special_tokens=False
+        ).input_ids.to(device)
+
+        target_lp = score_candidate_batch(model, prefix_ids, target_ids_for_batch, suffix_ids)
+        log_num = target_lp[0].item()
+        den_terms.append(target_lp.detach().cpu())
+
+    if log_num is None:
+        # This should not happen if target is in lexicon
+        print(f"[ERROR] Could not find target '{target_word}' in any batch!")
+        return float("nan")
+
+    all_den = torch.cat(den_terms).double()
+    log_den = torch.logsumexp(all_den, dim=0).item()
+
     bi_val = -(log_num - log_den) / math.log(2)
 
-    if bi_val < -1e-6:
-        print(f"[WARNING] Negative word-level BI surprisal: {bi_val:.6f}")
+    # This should now be impossible, but keep as safety check
+    if bi_val < 0:
+        if abs(bi_val) < 1e-9:
+            bi_val = 0.0
+        else:
+            print(f"[ERROR] Unexpected negative BI surprisal: {bi_val:.10f} "
+                  f"(log_num={log_num:.6f}, log_den={log_den:.6f})")
+            bi_val = 0.0
 
-    return max(bi_val, 0.0)
+    return bi_val
 
 
-def load_model_and_tokenizer(model_id, force_fp16=False):
+def load_model_and_tokenizer(model_id, force_no_quant=False):
     SMALL_MODEL_THRESHOLD = 1_000_000_000
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -211,7 +257,7 @@ def load_model_and_tokenizer(model_id, force_fp16=False):
     n_params = sum(p.numel() for p in dummy.parameters())
     del dummy
 
-    use_quantization = n_params >= SMALL_MODEL_THRESHOLD and not force_fp16
+    use_quantization = n_params >= SMALL_MODEL_THRESHOLD and not force_no_quant
 
     if use_quantization:
         bnb_config = BitsAndBytesConfig(
@@ -224,11 +270,17 @@ def load_model_and_tokenizer(model_id, force_fp16=False):
             quantization_config=bnb_config,
             device_map="auto",
         )
-    else:
-        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in bf16...")
+    elif n_params >= SMALL_MODEL_THRESHOLD:
+        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in bf16 (no quantization)...")
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    else:
+        print(f"Loading model {model_id} ({n_params/1e6:.0f}M params) in fp32...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
             device_map="auto",
         )
 
@@ -259,19 +311,21 @@ def run_for_model(
     suffix_col,
     cand_batch_size,
     save_every,
-    quantizaton
+    no_quantization,
 ):
     print("=" * 80)
     print(f"RUNNING MODEL: {model_id}")
     print("=" * 80)
 
     df = pd.read_csv(input_csv)
-    model, tokenizer, device = load_model_and_tokenizer(model_id, force_fp16=quantizaton)
+    model, tokenizer, device = load_model_and_tokenizer(model_id, force_no_quant=no_quantization)
 
     candidate_words = load_candidate_words(lexicon_file)
     print(f"Loaded {len(candidate_words)} candidate words.")
 
-    candidate_groups, candidate_word_set = build_candidate_groups(tokenizer, candidate_words, device)
+    candidate_groups, candidate_word_set, word_location = build_candidate_groups(
+        tokenizer, candidate_words, device
+    )
     print("Built candidate groups by token length:")
     for tok_len in sorted(candidate_groups.keys()):
         print(f"  token_len={tok_len}: {len(candidate_groups[tok_len]['words'])} words")
@@ -324,6 +378,7 @@ def run_for_model(
                 suffix=row[suffix_col],
                 candidate_groups=candidate_groups,
                 candidate_word_set=candidate_word_set,
+                word_location=word_location,
                 device=device,
                 cand_batch_size=cand_batch_size,
             )
@@ -388,7 +443,8 @@ def main():
 
     parser.add_argument("--cand_batch_size", type=int, default=128)
     parser.add_argument("--save_every", type=int, default=10)
-    parser.add_argument("--no_quantization", action="store_true")
+    parser.add_argument("--no_quantization", action="store_true",
+                        help="Use bf16 instead of 8-bit quantization for large models")
 
     args = parser.parse_args()
 
@@ -410,7 +466,7 @@ def main():
             suffix_col=args.suffix_col,
             cand_batch_size=args.cand_batch_size,
             save_every=args.save_every,
-            quantizaton=args.no_quantization
+            no_quantization=args.no_quantization,
         )
 
 
