@@ -1,42 +1,250 @@
-import argparse
-import math
+import gc
 import os
+import re
+import math
+import argparse
 import traceback
+from collections import defaultdict
+
 import pandas as pd
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, AutoConfig
 from tqdm import tqdm
 
+import torch
+import torch.nn.functional as F
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-def score_continuation_logprob(model, prefix_ids, continuation_ids):
+from surprisal_utils import safe_model_name, safe_mode_name, normalize_word, cleanup_model
+
+
+def load_words_from_file(path):
+    words = []
+    seen = set()
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            w = normalize_word(line)
+            if not w:
+                continue
+            if w not in seen:
+                seen.add(w)
+                words.append(w)
+
+    return words
+
+def load_nltk_words_basic():
+    try:
+        import nltk
+        try:
+            nltk.data.find("corpora/words")
+        except LookupError:
+            nltk.download("words")
+        from nltk.corpus import words
+    except Exception as e:
+        raise RuntimeError(
+            "Could not load nltk words corpus. Install nltk and run nltk.download('words')."
+        ) from e
+
+    out = []
+    seen = set()
+
+    for w in words.words():
+        w = normalize_word(w)
+        if not w:
+            continue
+        if re.fullmatch(r"[a-z]+", w):
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+
+    return out
+
+def is_good_word_filtered(w, min_len=2, max_len=15, min_zipf=3.0):
+    if not w:
+        return False
+
+    w = w.lower().strip()
+
+    if not re.fullmatch(r"[a-z]+", w):
+        return False
+
+    if not (min_len <= len(w) <= max_len):
+        return False
+
+    if len(w) >= 5 and sum(ch in "aeiouy" for ch in w) == 0:
+        return False
+
+    if re.search(r"(.)\1\1", w):
+        return False
+
+    from wordfreq import zipf_frequency
+    if zipf_frequency(w, "en") < min_zipf:
+        return False
+
+    return True
+
+def load_filtered_nltk_dynamic(min_len=2, max_len=15, min_zipf=3.0):
+    raw_words = load_nltk_words_basic()
+    out = []
+    seen = set()
+
+    for w in raw_words:
+        if is_good_word_filtered(w, min_len=min_len, max_len=max_len, min_zipf=min_zipf):
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+
+    return out
+
+
+def load_wordfreq_topn(n=100000):
+    try:
+        from wordfreq import top_n_list
+    except Exception as e:
+        raise RuntimeError(
+            "Could not import wordfreq.top_n_list. Please install wordfreq."
+        ) from e
+
+    raw_words = top_n_list("en", n)
+
+    out = []
+    seen = set()
+
+    for w in raw_words:
+        w = normalize_word(w)
+        if not w:
+            continue
+        if re.fullmatch(r"[a-z]+", w):
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+
+    return out
+
+
+def extract_dataset_targets(df, target_col):
+    out = []
+    seen = set()
+
+    for x in df[target_col].dropna().astype(str).tolist():
+        w = normalize_word(x)
+        if not w:
+            continue
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+
+    return out
+
+
+def merge_words_preserve_order(*word_lists):
+    out = []
+    seen = set()
+
+    for words in word_lists:
+        for w in words:
+            w = normalize_word(w)
+            if not w:
+                continue
+            if w not in seen:
+                seen.add(w)
+                out.append(w)
+
+    return out
+
+
+def build_candidate_words(args, df, mode):
+    dataset_targets = extract_dataset_targets(df, args.target_col)
+
+    if mode == "filtered_nltk":
+        if not args.lexicon_file:
+            raise ValueError("--lexicon_file is required for mode=filtered_nltk")
+        base_words = load_words_from_file(args.lexicon_file)
+
+    elif mode == "raw_nltk":
+        base_words = load_nltk_words_basic()
+
+    elif mode == "wordfreq":
+        base_words = load_wordfreq_topn(args.wordfreq_topn)
+
+    else:
+        raise ValueError(f"Unknown lexicon mode: {mode}")
+
+    candidate_words = merge_words_preserve_order(base_words, dataset_targets)
+    return candidate_words
+
+def build_candidate_groups(tokenizer, candidate_words, device):
     """
-    Returns log P(continuation_ids | prefix_ids) in natural log.
-    prefix_ids: [1, p_len]
-    continuation_ids: [1, c_len]
+    Pre-tokenize candidate words and group them by token length.
     """
-    full_ids = torch.cat([prefix_ids, continuation_ids], dim=1)
+    groups = defaultdict(lambda: {"words": [], "ids": []})
+    candidate_word_set = set()
 
-    with torch.no_grad():
-        logits = model(full_ids).logits[0]  # [seq_len, vocab]
+    for w in tqdm(candidate_words, desc="Tokenizing candidate lexicon", leave=False):
+        w = str(w).strip()
+        if not w:
+            continue
 
-    p_len = prefix_ids.shape[1]
-    c_len = continuation_ids.shape[1]
+        ids = tokenizer(" " + w, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+        if ids.shape[1] == 0:
+            continue
 
-    total_lp = 0.0
-    for pos in range(c_len):
-        token_id = continuation_ids[0, pos].item()
-        step_logits = logits[p_len - 1 + pos].float()
-        log_probs = F.log_softmax(step_logits, dim=-1)
-        total_lp += log_probs[token_id].item()
+        tok_len = ids.shape[1]
+        groups[tok_len]["words"].append(w)
+        groups[tok_len]["ids"].append(ids)
+        candidate_word_set.add(w)
 
-    return total_lp
+    return groups, candidate_word_set
 
+
+def load_model_and_tokenizer(model_id, force_no_quant=False):
+    SMALL_MODEL_THRESHOLD = 1_000_000_000
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    config = AutoConfig.from_pretrained(model_id)
+    with torch.device("meta"):
+        dummy = AutoModelForCausalLM.from_config(config)
+    n_params = sum(p.numel() for p in dummy.parameters())
+    del dummy
+
+    use_quantization = n_params >= SMALL_MODEL_THRESHOLD and not force_no_quant
+
+    if use_quantization:
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True
+        )
+        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in 8-bit mode...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+        )
+    elif n_params >= SMALL_MODEL_THRESHOLD:
+        print(f"Loading model {model_id} ({n_params/1e9:.1f}B params) in bf16...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    else:
+        print(f"Loading model {model_id} ({n_params/1e6:.0f}M params) in fp32...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map="auto",
+        )
+
+    device = next(model.parameters()).device
+    model.eval()
+    print(f"Model loaded on device: {device}")
+
+    return model, tokenizer, device
 
 def compute_uni_surprisal_word(model, tokenizer, prefix, target, device):
     """
-    Whole-word unidirectional surprisal:
-    -log2 P(target_word_tokens | prefix)
+    Word-level unidirectional surprisal:
+    -log2 P(target_word | prefix)
+    computed as sum over target tokens.
     """
     if pd.isna(prefix) or pd.isna(target):
         return None
@@ -81,169 +289,169 @@ def compute_uni_surprisal_word(model, tokenizer, prefix, target, device):
     }
 
 
-def load_candidate_words(lexicon_file):
-    words = []
-    seen = set()
-
-    with open(lexicon_file, "r", encoding="utf-8") as f:
-        for line in f:
-            w = line.strip()
-            if not w:
-                continue
-            if w not in seen:
-                seen.add(w)
-                words.append(w)
-
-    return words
-
-
-def build_candidate_cache(tokenizer, candidate_words, device):
+def score_candidate_batch(model, prefix_ids, cand_ids_batch, suffix_ids):
     """
-    Pre-tokenize candidate words once.
-    Returns list of tuples: (word, token_ids_tensor [1, len])
+    Score log P(candidate_tokens + suffix | prefix) for a batch of candidates
+    that all have the same token length.
+
+    Returns:
+        [B] tensor of log-probabilities in float64
     """
-    cache = []
-    seen = set()
+    B = cand_ids_batch.shape[0]
+    p_len = prefix_ids.shape[1]
+    cand_len = cand_ids_batch.shape[1]
+    s_len = suffix_ids.shape[1]
 
-    for w in tqdm(candidate_words, desc="Tokenizing candidate lexicon"):
-        w = str(w).strip()
-        if not w or w in seen:
-            continue
-        seen.add(w)
+    batch_prefix = prefix_ids.expand(B, -1)
+    batch_suffix = suffix_ids.expand(B, -1)
 
-        ids = tokenizer(" " + w, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    full_ids = torch.cat([batch_prefix, cand_ids_batch, batch_suffix], dim=1)
 
-        # skip candidates that tokenize to empty
-        if ids.shape[1] == 0:
-            continue
+    with torch.no_grad():
+        logits = model(full_ids).logits
 
-        cache.append((w, ids))
+    total_lp = torch.zeros(B, device=logits.device, dtype=torch.float64)
 
-    return cache
+    for j in range(cand_len):
+        step_logits = logits[:, p_len - 1 + j, :].float()
+        step_log_probs = F.log_softmax(step_logits, dim=-1).double()
+        token_ids = cand_ids_batch[:, j].unsqueeze(1)
+        total_lp += step_log_probs.gather(1, token_ids).squeeze(1)
+
+    for j in range(s_len):
+        step_logits = logits[:, p_len + cand_len - 1 + j, :].float()
+        step_log_probs = F.log_softmax(step_logits, dim=-1).double()
+        token_ids = batch_suffix[:, j].unsqueeze(1)
+        total_lp += step_log_probs.gather(1, token_ids).squeeze(1)
+
+    return total_lp
 
 
-def compute_bi_surprisal_word(
+def compute_bi_surprisal_word_batched(
     model,
     tokenizer,
     prefix,
     target,
     suffix,
-    candidate_cache,
+    candidate_groups,
     candidate_word_set,
     device,
+    cand_batch_size=128,
 ):
     """
-    Whole-word bidirectional surprisal:
+    Word-level cloze surprisal under a causal LM:
 
-    P(target_word | prefix, suffix)
-    = P(target_word_tokens, suffix | prefix)
-      / sum_{w in candidate_words} P(tokens(w), suffix | prefix)
+        P(target | prefix, suffix)
+        =
+        P(target, suffix | prefix)
+        /
+        sum_w P(w, suffix | prefix)
 
-    Returns surprisal in bits.
+    surprisal = -log2 P(target | prefix, suffix)
     """
-    if pd.isna(prefix) or pd.isna(target) or pd.isna(suffix):
+    if pd.isna(prefix) or pd.isna(target):
         return float("nan")
 
     prefix_str = str(prefix).rstrip()
     target_word = str(target).strip()
-    suffix_text = str(suffix).strip()
-
+    suffix_text = "" if pd.isna(suffix) else str(suffix).strip()
     suffix_str = (" " + suffix_text) if suffix_text else ""
 
     prefix_ids = tokenizer(prefix_str, return_tensors="pt", add_special_tokens=True).input_ids.to(device)
     suffix_ids = tokenizer(suffix_str, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
 
-    # numerator: target word + suffix
-    target_ids = tokenizer(" " + target_word, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-    true_continuation = torch.cat([target_ids, suffix_ids], dim=1)
-
-    log_num = score_continuation_logprob(model, prefix_ids, true_continuation)
-
+    target_in_lexicon = target_word in candidate_word_set
+    log_num = None
     den_terms = []
 
-    for cand_word, cand_ids in candidate_cache:
-        cand_continuation = torch.cat([cand_ids, suffix_ids], dim=1)
-        cand_lp = score_continuation_logprob(model, prefix_ids, cand_continuation)
-        den_terms.append(cand_lp)
+    for tok_len in sorted(candidate_groups.keys()):
+        group = candidate_groups[tok_len]
+        ids_list = group["ids"]
+        words_list = group["words"]
+        n = len(ids_list)
 
-    # Ensure target included
-    if target_word not in candidate_word_set:
-        den_terms.append(log_num)
+        for start in range(0, n, cand_batch_size):
+            end = min(start + cand_batch_size, n)
+            batch_ids = ids_list[start:end]
+            batch_words = words_list[start:end]
 
-    log_den = torch.logsumexp(torch.tensor(den_terms, dtype=torch.float64), dim=0).item()
+            cand_ids_batch = torch.cat(batch_ids, dim=0)
+            batch_lp = score_candidate_batch(model, prefix_ids, cand_ids_batch, suffix_ids)
+
+            den_terms.append(batch_lp.detach().cpu())
+
+            if target_in_lexicon and log_num is None:
+                for local_idx, w in enumerate(batch_words):
+                    if w == target_word:
+                        log_num = batch_lp[local_idx].item()
+                        break
+
+    if not target_in_lexicon:
+        target_ids = tokenizer(
+            " " + target_word,
+            return_tensors="pt",
+            add_special_tokens=False
+        ).input_ids.to(device)
+
+        target_lp = score_candidate_batch(model, prefix_ids, target_ids, suffix_ids)
+        log_num = target_lp[0].item()
+        den_terms.append(target_lp.detach().cpu())
+
+    if log_num is None:
+        print(f"[ERROR] Could not find target '{target_word}' in denominator candidates.")
+        return float("nan")
+
+    all_den = torch.cat(den_terms).double()
+    log_den = torch.logsumexp(all_den, dim=0).item()
 
     bi_val = -(log_num - log_den) / math.log(2)
 
-    if bi_val < -1e-6:
-        print(f"[WARNING] Negative word-level BI surprisal: {bi_val:.6f}")
+    if bi_val < 0:
+        if abs(bi_val) < 1e-9:
+            bi_val = 0.0
+        else:
+            print(
+                f"[ERROR] Unexpected negative BI surprisal: {bi_val:.10f} "
+                f"(log_num={log_num:.6f}, log_den={log_den:.6f})"
+            )
+            bi_val = 0.0
 
-    return max(bi_val, 0.0)
+    return bi_val
 
 
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--input_csv", type=str, default="data_output/bk21_stimuli_final.csv")
-    parser.add_argument("--output_csv", type=str, required=True)
-    parser.add_argument("--model_id", type=str, required=True)
-
-    parser.add_argument("--lexicon_file", type=str, required=True,
-                        help="Path to candidate word lexicon (one word per line)")
-
-    parser.add_argument("--output_col_uni", type=str, default="uni_surprisal_word")
-    parser.add_argument("--output_col_bi", type=str, default="bi_surprisal_word")
-
-    parser.add_argument("--prefix_col", type=str, default="prefix")
-    parser.add_argument("--target_col", type=str, default="target_llm")
-    parser.add_argument("--suffix_col", type=str, default="suffix")
-
-    parser.add_argument("--save_every", type=int, default=10)
-
-    args = parser.parse_args()
+def run_for_model_and_mode(model_id, lexicon_mode, args):
+    print("=" * 90)
+    print(f"RUNNING MODEL: {model_id}")
+    print(f"LEXICON MODE : {lexicon_mode}")
+    print("=" * 90)
 
     df = pd.read_csv(args.input_csv)
 
-    SMALL_MODEL_THRESHOLD = 1_000_000_000
+    model, tokenizer, device = load_model_and_tokenizer(
+        model_id,
+        force_no_quant=args.no_quantization
+    )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    candidate_words = build_candidate_words(args, df, lexicon_mode)
+    print(f"Loaded {len(candidate_words)} candidate words for mode={lexicon_mode}")
 
-    config = AutoConfig.from_pretrained(args.model_id)
-    with torch.device("meta"):
-        dummy = AutoModelForCausalLM.from_config(config)
-    n_params = sum(p.numel() for p in dummy.parameters())
-    del dummy
+    candidate_groups, candidate_word_set = build_candidate_groups(
+        tokenizer, candidate_words, device
+    )
 
-    use_quantization = n_params >= SMALL_MODEL_THRESHOLD
+    print("Built candidate groups by token length:")
+    for tok_len in sorted(candidate_groups.keys()):
+        print(f"  token_len={tok_len}: {len(candidate_groups[tok_len]['words'])} words")
 
-    if use_quantization:
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-        print(f"Loading model {args.model_id} ({n_params/1e9:.1f}B params) in 8-bit mode...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-    else:
-        print(f"Loading model {args.model_id} ({n_params/1e6:.0f}M params) in fp32...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_id,
-            device_map="auto",
-        )
+    model_name = safe_model_name(model_id)
+    mode_name = safe_mode_name(lexicon_mode)
 
-    device = next(model.parameters()).device
-    model.eval()
-    print(f"Model loaded on device: {device}")
-
-    # Load and cache candidate words
-    candidate_words = load_candidate_words(args.lexicon_file)
-    candidate_word_set = set(candidate_words)
-    print(f"Loaded {len(candidate_words)} candidate words from lexicon.")
-
-    candidate_cache = build_candidate_cache(tokenizer, candidate_words, device)
-    print(f"Cached {len(candidate_cache)} tokenized candidate words.")
-
-    checkpoint_path = args.output_csv.replace(".csv", "_checkpoint.csv")
-    metadata_path = args.output_csv.replace(".csv", "_metadata.pt")
+    output_csv = os.path.join(
+        args.output_dir,
+        f"{model_name}__{mode_name}__wordlevel.csv"
+    )
+    checkpoint_path = output_csv.replace(".csv", "_checkpoint.csv")
+    metadata_path = output_csv.replace(".csv", "_metadata.pt")
 
     if os.path.exists(checkpoint_path):
         checkpoint_df = pd.read_csv(checkpoint_path)
@@ -268,7 +476,7 @@ def main():
     else:
         metadata_list = []
 
-    for i, row in tqdm(df.iterrows(), total=len(df)):
+    for i, row in tqdm(df.iterrows(), total=len(df), desc=f"{model_name} | {mode_name}"):
         if i in completed_indices:
             continue
 
@@ -282,15 +490,16 @@ def main():
             )
             uni_val = res["uni_val"] if res else float("nan")
 
-            bi_val = compute_bi_surprisal_word(
+            bi_val = compute_bi_surprisal_word_batched(
                 model=model,
                 tokenizer=tokenizer,
                 prefix=row[args.prefix_col],
                 target=row[args.target_col],
                 suffix=row[args.suffix_col],
-                candidate_cache=candidate_cache,
+                candidate_groups=candidate_groups,
                 candidate_word_set=candidate_word_set,
                 device=device,
+                cand_batch_size=args.cand_batch_size,
             )
 
             df.at[i, args.output_col_uni] = uni_val
@@ -298,10 +507,14 @@ def main():
 
             metadata_list.append({
                 "index": i,
-                "model_id": args.model_id,
+                "model_id": model_id,
+                "lexicon_mode": lexicon_mode,
                 "uni_surprisal_word": uni_val,
                 "bi_surprisal_word": bi_val,
                 "token_data": res["token_data"] if res else None,
+                "cand_batch_size": args.cand_batch_size,
+                "lexicon_size": len(candidate_word_set),
+                "wordfreq_topn": args.wordfreq_topn if lexicon_mode == "wordfreq" else None,
             })
 
             if i % args.save_every == 0:
@@ -313,6 +526,7 @@ def main():
             df.to_csv(checkpoint_path, index=False)
             torch.save(metadata_list, metadata_path)
             print(f"Checkpoint saved to {checkpoint_path}. Re-run to resume.")
+            cleanup_model(model, tokenizer)
             return
 
         except Exception as e:
@@ -321,14 +535,66 @@ def main():
             df.at[i, args.output_col_uni] = float("nan")
             df.at[i, args.output_col_bi] = float("nan")
 
-    df.to_csv(args.output_csv, index=False)
+    df.to_csv(output_csv, index=False)
     torch.save(metadata_list, metadata_path)
 
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
 
-    print(f"Done! CSV saved to {args.output_csv}")
+    print(f"Done! CSV saved to {output_csv}")
     print(f"Metadata saved to {metadata_path}")
+
+    cleanup_model(model, tokenizer)
+    
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--input_csv", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+
+    parser.add_argument("--model_ids", type=str, nargs="+", required=True)
+
+    parser.add_argument(
+        "--lexicon_modes",
+        type=str,
+        nargs="+",
+        required=True,
+        choices=["filtered_nltk", "raw_nltk", "wordfreq"],
+    )
+
+    parser.add_argument(
+        "--lexicon_file",
+        type=str,
+        default=None,
+        help="Required for lexicon_mode=filtered_nltk"
+    )
+
+    parser.add_argument("--output_col_uni", type=str, default="uni_surprisal_word")
+    parser.add_argument("--output_col_bi", type=str, default="bi_surprisal_word")
+
+    parser.add_argument("--prefix_col", type=str, default="prefix")
+    parser.add_argument("--target_col", type=str, default="target_llm")
+    parser.add_argument("--suffix_col", type=str, default="suffix")
+
+    parser.add_argument("--cand_batch_size", type=int, default=128)
+    parser.add_argument("--save_every", type=int, default=10)
+
+    parser.add_argument("--wordfreq_topn", type=int, default=100000,
+                        help="Number of top English words to use for lexicon_mode=wordfreq")
+
+    parser.add_argument("--no_quantization", action="store_true")
+
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    for model_id in args.model_ids:
+        for lexicon_mode in args.lexicon_modes:
+            run_for_model_and_mode(
+                model_id=model_id,
+                lexicon_mode=lexicon_mode,
+                args=args,
+            )
 
 
 if __name__ == "__main__":

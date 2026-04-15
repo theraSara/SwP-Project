@@ -232,7 +232,7 @@ def compute_bi_surprisal_word_batched(
 
     bi_val = -(log_num - log_den) / math.log(2)
 
-    # This should now be impossible, but keep as safety check
+    # This should be impossible, but keep as safety check
     if bi_val < 0:
         if abs(bi_val) < 1e-9:
             bi_val = 0.0

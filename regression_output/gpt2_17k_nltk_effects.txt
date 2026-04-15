@@ -1,0 +1,114 @@
+
+================ UNIDIRECTIONAL - 17k NLTK ================
+Linear mixed model fit by maximum likelihood . t-tests use Satterthwaite's
+  method [lmerModLmerTest]
+Formula: log_rt ~ s_gpt2_uni + s_word_length + s_word_freq + s_word_pos +  
+    (1 | SUB) + (1 | ITEM)
+   Data: df
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+  10401.6   10471.5   -5192.8   10385.6     46084 
+
+Scaled residuals: 
+     Min       1Q   Median       3Q      Max 
+-10.0307  -0.6020  -0.1256   0.4963   6.4106 
+
+Random effects:
+ Groups   Name        Variance Std.Dev.
+ SUB      (Intercept) 0.104487 0.32324 
+ ITEM     (Intercept) 0.004216 0.06493 
+ Residual             0.070527 0.26557 
+Number of obs: 46092, groups:  SUB, 216; ITEM, 216
+
+Fixed effects:
+               Estimate Std. Error        df t value Pr(>|t|)    
+(Intercept)   6.769e+00  2.247e-02 2.333e+02 301.256  < 2e-16 ***
+s_gpt2_uni    9.932e-03  1.548e-03 3.767e+04   6.417 1.41e-10 ***
+s_word_length 1.061e-02  4.699e-03 2.146e+02   2.259 0.024918 *  
+s_word_freq   1.841e-03  4.706e-03 2.178e+02   0.391 0.695937    
+s_word_pos    1.724e-02  4.558e-03 2.156e+02   3.782 0.000202 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+            (Intr) s_gp2_ s_wrd_l s_wrd_f
+s_gpt2_uni   0.000                       
+s_wrd_lngth  0.001  0.010                
+s_word_freq -0.001  0.086  0.211         
+s_word_pos   0.003  0.008  0.040   0.009 
+[1] "--- Does GPT-2 (UNI) using 'NLTK' word dictionary improve over baseline? ---"
+Data: df
+Models:
+m_base: log_rt ~ s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_gpt2: log_rt ~ s_gpt2_uni + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+       npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)    
+m_base    7 10441 10502 -5213.4     10427                         
+m_gpt2    8 10402 10472 -5192.8     10386 41.098  1  1.448e-10 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+[1] "--- Does GPT-2 (UNI) explain variance not captured by humans? ---"
+Data: df
+Models:
+m_cloze: log_rt ~ s_cloze + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_both_gpt2: log_rt ~ s_cloze + s_gpt2_uni + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+            npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)  
+m_cloze        8 10403 10473 -5193.4     10387                       
+m_both_gpt2    9 10399 10477 -5190.3     10381 6.2034  1    0.01275 *
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+================ BIDIRECTIONAL - 17k NLTK ================
+Linear mixed model fit by maximum likelihood . t-tests use Satterthwaite's
+  method [lmerModLmerTest]
+Formula: log_rt ~ s_gpt2_bi + s_word_length + s_word_freq + s_word_pos +  
+    (1 | SUB) + (1 | ITEM)
+   Data: df
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+  10416.3   10486.2   -5200.2   10400.3     46084 
+
+Scaled residuals: 
+     Min       1Q   Median       3Q      Max 
+-10.0316  -0.6018  -0.1250   0.4958   6.4283 
+
+Random effects:
+ Groups   Name        Variance Std.Dev.
+ SUB      (Intercept) 0.10449  0.32325 
+ ITEM     (Intercept) 0.00418  0.06466 
+ Residual             0.07055  0.26562 
+Number of obs: 46092, groups:  SUB, 216; ITEM, 216
+
+Fixed effects:
+               Estimate Std. Error        df t value Pr(>|t|)    
+(Intercept)   6.769e+00  2.246e-02 2.331e+02 301.300  < 2e-16 ***
+s_gpt2_bi     8.928e-03  1.736e-03 2.538e+04   5.143 2.73e-07 ***
+s_word_length 1.106e-02  4.683e-03 2.150e+02   2.361 0.019126 *  
+s_word_freq   1.721e-03  4.695e-03 2.190e+02   0.366 0.714346    
+s_word_pos    1.685e-02  4.540e-03 2.156e+02   3.711 0.000263 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Correlation of Fixed Effects:
+            (Intr) s_gp2_ s_wrd_l s_wrd_f
+s_gpt2_bi    0.000                       
+s_wrd_lngth  0.001  0.031                
+s_word_freq -0.001  0.102  0.213         
+s_word_pos   0.003 -0.007  0.040   0.007 
+[1] "--- Does GPT-2 (BI) using 'NLTK' word dictionary improve over baseline? ---"
+Data: df
+Models:
+m_base: log_rt ~ s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_gpt2_bi: log_rt ~ s_gpt2_bi + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+          npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)    
+m_base       7 10441 10502 -5213.4     10427                         
+m_gpt2_bi    8 10416 10486 -5200.2     10400 26.413  1  2.756e-07 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+[1] "--- Does GPT-2 (BI) explain variance not captured by humans? ---"
+Data: df
+Models:
+m_cloze: log_rt ~ s_cloze + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+m_both_gpt2_bi: log_rt ~ s_cloze + s_gpt2_bi + s_word_length + s_word_freq + s_word_pos + (1 | SUB) + (1 | ITEM)
+               npar   AIC   BIC  logLik -2*log(L)  Chisq Df Pr(>Chisq)
+m_cloze           8 10403 10473 -5193.4     10387                     
+m_both_gpt2_bi    9 10404 10482 -5192.9     10386 1.0475  1     0.3061
