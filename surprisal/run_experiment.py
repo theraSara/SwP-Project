@@ -6,21 +6,21 @@ import torch
 import pandas as pd
 from tqdm import tqdm
 
-from surprisal.io_utils import (
+from io_utils import (
     finalize_run,
     load_checkpoint,
     load_metadata,
     make_output_paths,
     save_progress,
 )
-from surprisal.lexicon_utils import build_candidate_groups, build_candidate_words
-from surprisal.model_utils import (
+from lexicon_utils import build_candidate_groups, build_candidate_words
+from model_utils import (
     cleanup_model,
     load_model_and_tokenizer,
     safe_model_name,
     safe_mode_name,
 )
-from surprisal.scoring import (
+from scoring import (
     compute_bi_surprisal_word_batched,
     compute_uni_surprisal_word,
 )
